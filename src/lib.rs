@@ -5,7 +5,9 @@
 use std::{
     cell::Cell,
     ffi::c_void,
+    fmt,
     marker::PhantomData,
+    ops::{ControlFlow, Deref},
     ptr::null_mut,
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -143,7 +145,7 @@ impl<T> RcuBox<T> {
     }
 
     /// Get shared access to the inner value with a lifetime tied to a read side critical section.
-    pub fn read<'a>(&'a self, _rscs: &'a RcuRSCS) -> &'a T {
+    pub fn read<'a>(&'a self, _rscs: &'a RcuRSCS) -> RcuRef<'a, T> {
         unsafe {
             #[cfg(atomic_ptr)]
             let ptr = read_volatile(
@@ -153,7 +155,7 @@ impl<T> RcuBox<T> {
             #[cfg(not(atomic_ptr))]
             let ptr = rcu_dereference_sym(self.ptr as *mut c_void) as *mut RcuHead<T>;
 
-            &(*ptr).val
+            RcuRef::new(ptr)
         }
     }
 }
@@ -183,6 +185,70 @@ where
             call_rcu_memb(old_ptr as *mut c_void, drop_rcu::<T>);
         }
     }
+
+    /// Assign a new value to the RCU-protected box if it matches the given reference to the current value.
+    pub fn compare_and_update<'a, R>(
+        &'a self,
+        mut curr: RcuRef<'a, T>,
+        val: T,
+        mut retry: R,
+    ) -> Result<RcuRef<'a, T>, RcuRef<'a, T>>
+    where
+        R: FnMut(RcuRef<'a, T>, &mut T) -> ControlFlow<()>,
+    {
+        let new_ptr = Box::into_raw(Box::new(RcuHead::new(val)));
+
+        unsafe {
+            loop {
+                #[cfg(atomic_ptr)]
+                let result = self.ptr.compare_exchange(
+                    curr.ptr as *mut RcuHead<T>,
+                    new_ptr,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+
+                #[cfg(not(atomic_ptr))]
+                let result = {
+                    let curr_ptr = rcu_cmpxchg_pointer_sym(
+                        &self.ptr as *const *mut RcuHead<T> as *mut *mut RcuHead<T>
+                            as *mut *mut c_void,
+                        curr.ptr as *mut RcuHead<T> as *mut c_void,
+                        new_ptr as *mut c_void,
+                    ) as *mut RcuHead<T>;
+
+                    if curr_ptr == curr.ptr as *mut RcuHead<T> {
+                        Ok(curr_ptr)
+                    } else {
+                        Err(curr_ptr)
+                    }
+                };
+
+                match result {
+                    Ok(curr_ptr) => {
+                        curr.ptr = new_ptr;
+
+                        unsafe extern "C" fn drop_rcu<T>(head: *mut c_void) {
+                            let _ = Box::from_raw(head as *mut RcuHead<T>);
+                        }
+
+                        call_rcu_memb(curr_ptr as *mut c_void, drop_rcu::<T>);
+
+                        return Ok(curr);
+                    }
+                    Err(curr_ptr) => {
+                        curr.ptr = curr_ptr;
+
+                        if let ControlFlow::Break(()) = retry(curr, &mut (*new_ptr).val) {
+                            let _ = Box::from_raw(new_ptr);
+
+                            return Err(curr);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl<T> Drop for RcuBox<T> {
@@ -194,6 +260,48 @@ impl<T> Drop for RcuBox<T> {
             #[cfg(not(atomic_ptr))]
             let _ = Box::from_raw(self.ptr);
         }
+    }
+}
+
+/// Reference to the current value of a RCU-protected box.
+pub struct RcuRef<'a, T> {
+    ptr: *const RcuHead<T>,
+    _marker: PhantomData<&'a T>,
+}
+
+impl<T> Clone for RcuRef<'_, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for RcuRef<'_, T> {}
+
+impl<T> fmt::Debug for RcuRef<'_, T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{:#x}", self.ptr as usize)
+    }
+}
+
+impl<'a, T> RcuRef<'a, T> {
+    unsafe fn new(ptr: *const RcuHead<T>) -> Self {
+        Self {
+            ptr,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Decay into reference will full lifetime associated with RSCS.
+    pub fn into_ref(self) -> &'a T {
+        unsafe { &(*self.ptr).val }
+    }
+}
+
+impl<T> Deref for RcuRef<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { &(*self.ptr).val }
     }
 }
 
@@ -234,6 +342,11 @@ extern "C" {
 extern "C" {
     fn rcu_dereference_sym(ptr: *mut c_void) -> *mut c_void;
     fn rcu_xchg_pointer_sym(ptr: *mut *mut c_void, new_ptr: *mut c_void) -> *mut c_void;
+    fn rcu_cmpxchg_pointer_sym(
+        ptr: *mut *mut c_void,
+        old_ptr: *mut c_void,
+        new_ptr: *mut c_void,
+    ) -> *mut c_void;
 }
 
 #[cfg(test)]
@@ -322,7 +435,7 @@ mod tests {
 
         struct CountDrops {
             reads: AtomicUsize,
-            generation: usize,
+            updates: usize,
         }
 
         impl Drop for CountDrops {
@@ -333,7 +446,7 @@ mod tests {
 
         let mut count_drops = RcuBox::new(CountDrops {
             reads: AtomicUsize::new(0),
-            generation: 0,
+            updates: 0,
         });
 
         const NUM_THREADS: usize = 1 << 10;
@@ -350,11 +463,21 @@ mod tests {
                         });
                     }
 
-                    let generation = rcu.rscs(|rscs| count_drops.read(rscs).generation);
+                    rcu.rscs(|rscs| {
+                        let curr = count_drops.read(rscs);
 
-                    count_drops.update(CountDrops {
-                        reads: AtomicUsize::new(0),
-                        generation: generation + 1,
+                        let val = CountDrops {
+                            reads: AtomicUsize::new(0),
+                            updates: curr.updates + 1,
+                        };
+
+                        count_drops
+                            .compare_and_update(curr, val, |curr, val| {
+                                val.updates = curr.updates + 1;
+
+                                ControlFlow::Continue(())
+                            })
+                            .unwrap();
                     });
 
                     for _ in 0..NUM_ITERS / 2 {
@@ -367,7 +490,7 @@ mod tests {
         })
         .unwrap();
 
-        assert_ne!(count_drops.get_mut().generation, 0);
+        assert_eq!(count_drops.get_mut().updates, NUM_THREADS);
 
         drop(count_drops);
 
