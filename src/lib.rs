@@ -7,8 +7,9 @@ use std::{
     ffi::c_void,
     fmt,
     marker::PhantomData,
+    mem::forget,
     ops::{ControlFlow, Deref},
-    ptr::null_mut,
+    ptr::{null_mut, read},
     sync::atomic::{AtomicBool, Ordering},
 };
 
@@ -109,7 +110,10 @@ impl Drop for RcuRSCS {
 }
 
 /// A variant of `Box<T>` protected by the userspace RCU library.
-pub struct RcuBox<T> {
+pub struct RcuBox<T>
+where
+    T: Send,
+{
     #[cfg(atomic_ptr)]
     ptr: AtomicPtr<RcuHead<T>>,
     #[cfg(not(atomic_ptr))]
@@ -118,9 +122,12 @@ pub struct RcuBox<T> {
 
 unsafe impl<T> Send for RcuBox<T> where T: Send {}
 
-unsafe impl<T> Sync for RcuBox<T> where T: Sync {}
+unsafe impl<T> Sync for RcuBox<T> where T: Send + Sync {}
 
-impl<T> RcuBox<T> {
+impl<T> RcuBox<T>
+where
+    T: Send,
+{
     /// Initialize an RCU-protected box with the given value.
     pub fn new(val: T) -> Self {
         let ptr = Box::into_raw(Box::new(RcuHead::new(val)));
@@ -131,16 +138,22 @@ impl<T> RcuBox<T> {
         Self { ptr }
     }
 
-    /// Get exclusive access to the inner value given exclusive access to the RCU-protected box.
-    pub fn get_mut(&mut self) -> &mut T {
-        #[cfg(atomic_ptr)]
-        unsafe {
-            &mut (**self.ptr.get_mut()).val
-        }
+    /// Wait for the next grace period to take full ownership of the inner value.
+    pub fn into_inner(mut self) -> T {
+        #![cfg_attr(not(atomic_ptr), allow(unused_mut))]
 
-        #[cfg(not(atomic_ptr))]
         unsafe {
-            &mut (*self.ptr).val
+            synchronize_rcu_memb();
+
+            #[cfg(atomic_ptr)]
+            let head = read(*self.ptr.get_mut());
+
+            #[cfg(not(atomic_ptr))]
+            let head = read(self.ptr);
+
+            forget(self);
+
+            head.val
         }
     }
 
@@ -158,32 +171,26 @@ impl<T> RcuBox<T> {
             RcuRef::new(ptr)
         }
     }
-}
 
-impl<T> RcuBox<T>
-where
-    T: Send,
-{
     /// Assign a new value to the RCU-protected box which will eventually become visible to readers.
-    pub fn update(&self, val: T) {
+    pub fn update(&self, val: T) -> RcuBox<T> {
         let new_ptr = Box::into_raw(Box::new(RcuHead::new(val)));
 
-        unsafe {
-            #[cfg(atomic_ptr)]
-            let old_ptr = self.ptr.swap(new_ptr, Ordering::AcqRel);
+        #[cfg(atomic_ptr)]
+        let old_ptr = self.ptr.swap(new_ptr, Ordering::AcqRel);
 
-            #[cfg(not(atomic_ptr))]
-            let old_ptr = rcu_xchg_pointer_sym(
+        #[cfg(not(atomic_ptr))]
+        let old_ptr = unsafe {
+            rcu_xchg_pointer_sym(
                 &self.ptr as *const *mut RcuHead<T> as *mut *mut RcuHead<T> as *mut *mut c_void,
                 new_ptr as *mut c_void,
-            );
+            ) as *mut RcuHead<T>
+        };
 
-            unsafe extern "C" fn drop_rcu<T>(head: *mut c_void) {
-                let _ = Box::from_raw(head as *mut RcuHead<T>);
-            }
+        #[cfg(atomic_ptr)]
+        let old_ptr = AtomicPtr::new(old_ptr);
 
-            call_rcu_memb(old_ptr as *mut c_void, drop_rcu::<T>);
-        }
+        Self { ptr: old_ptr }
     }
 
     /// Assign a new value to the RCU-protected box if it matches the given reference to the current value.
@@ -192,7 +199,7 @@ where
         mut curr: RcuRef<'a, T>,
         val: T,
         mut retry: R,
-    ) -> Result<RcuRef<'a, T>, RcuRef<'a, T>>
+    ) -> Result<(RcuRef<'a, T>, RcuBox<T>), RcuRef<'a, T>>
     where
         R: FnMut(RcuRef<'a, T>, &mut T) -> ControlFlow<()>,
     {
@@ -228,13 +235,12 @@ where
                     Ok(curr_ptr) => {
                         curr.ptr = new_ptr;
 
-                        unsafe extern "C" fn drop_rcu<T>(head: *mut c_void) {
-                            let _ = Box::from_raw(head as *mut RcuHead<T>);
-                        }
+                        #[cfg(atomic_ptr)]
+                        let curr_ptr = AtomicPtr::new(curr_ptr);
 
-                        call_rcu_memb(curr_ptr as *mut c_void, drop_rcu::<T>);
+                        let prev = Self { ptr: curr_ptr };
 
-                        return Ok(curr);
+                        return Ok((curr, prev));
                     }
                     Err(curr_ptr) => {
                         curr.ptr = curr_ptr;
@@ -251,14 +257,23 @@ where
     }
 }
 
-impl<T> Drop for RcuBox<T> {
+impl<T> Drop for RcuBox<T>
+where
+    T: Send,
+{
     fn drop(&mut self) {
-        unsafe {
-            #[cfg(atomic_ptr)]
-            let _ = Box::from_raw(*self.ptr.get_mut());
+        unsafe extern "C" fn drop_later<T>(head: *mut c_void) {
+            let _ = Box::from_raw(head as *mut RcuHead<T>);
+        }
 
-            #[cfg(not(atomic_ptr))]
-            let _ = Box::from_raw(self.ptr);
+        #[cfg(atomic_ptr)]
+        let ptr = *self.ptr.get_mut();
+
+        #[cfg(not(atomic_ptr))]
+        let ptr = self.ptr;
+
+        unsafe {
+            call_rcu_memb(ptr as *mut c_void, drop_later::<T>);
         }
     }
 }
@@ -333,6 +348,7 @@ extern "C" {
     fn rcu_read_lock_memb();
     fn rcu_read_unlock_memb();
 
+    fn synchronize_rcu_memb();
     fn rcu_barrier_memb();
 
     fn call_rcu_memb(head: *mut c_void, func: unsafe extern "C" fn(*mut c_void));
@@ -444,7 +460,7 @@ mod tests {
             }
         }
 
-        let mut count_drops = RcuBox::new(CountDrops {
+        let count_drops = RcuBox::new(CountDrops {
             reads: AtomicUsize::new(0),
             updates: 0,
         });
@@ -471,7 +487,7 @@ mod tests {
                             updates: curr.updates + 1,
                         };
 
-                        count_drops
+                        let _ = count_drops
                             .compare_and_update(curr, val, |curr, val| {
                                 val.updates = curr.updates + 1;
 
@@ -490,9 +506,7 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(count_drops.get_mut().updates, NUM_THREADS);
-
-        drop(count_drops);
+        assert_eq!(count_drops.into_inner().updates, NUM_THREADS);
 
         rcu.barrier();
 
