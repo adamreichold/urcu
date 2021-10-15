@@ -128,6 +128,16 @@ impl<T> RcuBox<T>
 where
     T: Send,
 {
+    /// Initialize an empty RCU-protected box.
+    pub fn empty() -> Self {
+        let ptr = null_mut();
+
+        #[cfg(atomic_ptr)]
+        let ptr = AtomicPtr::new(ptr);
+
+        Self { ptr }
+    }
+
     /// Initialize an RCU-protected box with the given value.
     pub fn new(val: T) -> Self {
         let ptr = Box::into_raw(Box::new(RcuHead::new(val)));
@@ -139,21 +149,25 @@ where
     }
 
     /// Wait for the next grace period to take full ownership of the inner value.
-    pub fn into_inner(mut self) -> T {
+    pub fn into_inner(mut self) -> Option<T> {
         #![cfg_attr(not(atomic_ptr), allow(unused_mut))]
 
         unsafe {
             synchronize_rcu_memb();
 
             #[cfg(atomic_ptr)]
-            let head = read(*self.ptr.get_mut());
+            let ptr = *self.ptr.get_mut();
 
             #[cfg(not(atomic_ptr))]
-            let head = read(self.ptr);
+            let ptr = self.ptr;
 
             forget(self);
 
-            head.val
+            if !ptr.is_null() {
+                Some(read(ptr).val)
+            } else {
+                None
+            }
         }
     }
 
@@ -272,8 +286,10 @@ where
         #[cfg(not(atomic_ptr))]
         let ptr = self.ptr;
 
-        unsafe {
-            call_rcu_memb(ptr as *mut c_void, drop_later::<T>);
+        if !ptr.is_null() {
+            unsafe {
+                call_rcu_memb(ptr as *mut c_void, drop_later::<T>);
+            }
         }
     }
 }
@@ -306,9 +322,22 @@ impl<'a, T> RcuRef<'a, T> {
         }
     }
 
+    /// Access reference if the RCU-protected was not empty.
+    pub fn as_ref(&self) -> Option<&T> {
+        if !self.ptr.is_null() {
+            unsafe { Some(&(*self.ptr).val) }
+        } else {
+            None
+        }
+    }
+
     /// Decay into reference will full lifetime associated with RSCS.
-    pub fn into_ref(self) -> &'a T {
-        unsafe { &(*self.ptr).val }
+    pub fn into_ref(self) -> Option<&'a T> {
+        if !self.ptr.is_null() {
+            unsafe { Some(&(*self.ptr).val) }
+        } else {
+            None
+        }
     }
 }
 
@@ -316,6 +345,7 @@ impl<T> Deref for RcuRef<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
+        assert!(!self.ptr.is_null());
         unsafe { &(*self.ptr).val }
     }
 }
@@ -506,7 +536,7 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(count_drops.into_inner().updates, NUM_THREADS);
+        assert_eq!(count_drops.into_inner().unwrap().updates, NUM_THREADS);
 
         rcu.barrier();
 
