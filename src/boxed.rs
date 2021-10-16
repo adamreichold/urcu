@@ -1,11 +1,6 @@
 //! A variant of `Box<T>` protected by the userspace RCU library.
 
-use std::{
-    ffi::c_void,
-    mem::forget,
-    ops::ControlFlow,
-    ptr::{null_mut, read},
-};
+use std::{ffi::c_void, mem::forget, ops::ControlFlow, ptr::null_mut};
 
 use crate::{call_rcu_memb, synchronize_rcu_memb, RcuHead, RcuPtr, RcuRSCS, RcuRef};
 
@@ -24,13 +19,17 @@ where
 {
     /// Initialize an empty RCU-protected box.
     pub fn empty() -> Self {
-        Self(RcuPtr::new(null_mut()))
+        unsafe { Self::from_raw(null_mut()) }
     }
 
     /// Initialize an RCU-protected box with the given value.
     pub fn new(val: T) -> Self {
         let ptr = Box::into_raw(Box::new(RcuHead::new(val)));
 
+        unsafe { Self::from_raw(ptr) }
+    }
+
+    pub(crate) unsafe fn from_raw(ptr: *mut RcuHead<T>) -> Self {
         Self(RcuPtr::new(ptr))
     }
 
@@ -44,7 +43,9 @@ where
             forget(self);
 
             if !ptr.is_null() {
-                Some(read(ptr).val)
+                let head = Box::from_raw(ptr);
+
+                Some(head.val)
             } else {
                 None
             }
@@ -58,11 +59,13 @@ where
 
     /// Assign a new value to the RCU-protected box which will eventually become visible to readers.
     pub fn update(&self, val: T) -> RcuBox<T> {
-        let new_ptr = Box::into_raw(Box::new(RcuHead::new(val)));
+        let mut val = Box::new(RcuHead::new(val));
 
-        let old_ptr = self.0.update(new_ptr);
+        let old_ptr = unsafe { self.0.update(&mut *val) };
 
-        Self(RcuPtr::new(old_ptr))
+        forget(val);
+
+        unsafe { Self::from_raw(old_ptr) }
     }
 
     /// Assign a new value to the RCU-protected box if it still matches the given reference to the current value.
@@ -75,23 +78,19 @@ where
     where
         R: FnMut(RcuRef<'a, T>, &mut T) -> ControlFlow<()>,
     {
-        let new_ptr = Box::into_raw(Box::new(RcuHead::new(val)));
+        let mut val = Box::new(RcuHead::new(val));
 
         loop {
-            match self.0.compare_and_update(curr, new_ptr) {
+            match unsafe { self.0.compare_and_update(curr, &mut *val) } {
                 Ok((curr, old_ptr)) => {
-                    return Ok((curr, Self(RcuPtr::new(old_ptr))));
+                    forget(val);
+
+                    return Ok((curr, unsafe { Self::from_raw(old_ptr) }));
                 }
                 Err(new_curr) => {
                     curr = new_curr;
 
-                    let val = unsafe { &mut (*new_ptr).val };
-
-                    if let ControlFlow::Break(()) = retry(curr, val) {
-                        unsafe {
-                            let _ = Box::from_raw(new_ptr);
-                        }
-
+                    if let ControlFlow::Break(()) = retry(curr, &mut val.val) {
                         return Err(curr);
                     }
                 }
@@ -106,15 +105,16 @@ where
 {
     fn drop(&mut self) {
         let ptr = self.0.as_ptr();
+        if ptr.is_null() {
+            return;
+        }
 
-        if !ptr.is_null() {
-            unsafe extern "C" fn drop_later<T>(head: *mut c_void) {
-                let _ = Box::from_raw(head as *mut RcuHead<T>);
-            }
+        unsafe extern "C" fn drop_later<T>(head: *mut c_void) {
+            let _ = Box::from_raw(head as *mut RcuHead<T>);
+        }
 
-            unsafe {
-                call_rcu_memb(ptr as *mut c_void, drop_later::<T>);
-            }
+        unsafe {
+            call_rcu_memb(ptr as *mut c_void, drop_later::<T>);
         }
     }
 }

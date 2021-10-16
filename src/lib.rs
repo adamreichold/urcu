@@ -3,6 +3,7 @@
 //! Safe wrapper of the memb variant of the [userspace RCU library](https://github.com/urcu/userspace-rcu).
 
 pub mod boxed;
+pub mod stack;
 
 use std::{
     cell::Cell,
@@ -124,7 +125,7 @@ impl<T> RcuPtr<T>
 where
     T: Send,
 {
-    fn new(ptr: *mut RcuHead<T>) -> Self {
+    unsafe fn new(ptr: *mut RcuHead<T>) -> Self {
         #[cfg(atomic_ptr)]
         let ptr = AtomicPtr::new(ptr);
 
@@ -154,7 +155,7 @@ where
         }
     }
 
-    fn update(&self, new_ptr: *mut RcuHead<T>) -> *mut RcuHead<T> {
+    unsafe fn update(&self, new_ptr: *mut RcuHead<T>) -> *mut RcuHead<T> {
         #[cfg(atomic_ptr)]
         let old_ptr = self.ptr.swap(new_ptr, Ordering::AcqRel);
 
@@ -169,7 +170,7 @@ where
         old_ptr
     }
 
-    fn compare_and_update<'a>(
+    unsafe fn compare_and_update<'a>(
         &'a self,
         mut curr: RcuRef<'a, T>,
         new_ptr: *mut RcuHead<T>,
@@ -259,6 +260,15 @@ impl<'a, T> RcuRef<'a, T> {
     }
 }
 
+impl<T> RcuRef<'_, T>
+where
+    T: Send,
+{
+    fn as_ptr(&self) -> *mut RcuHead<T> {
+        self.ptr
+    }
+}
+
 impl<T> Deref for RcuRef<'_, T> {
     type Target = T;
 
@@ -270,17 +280,17 @@ impl<T> Deref for RcuRef<'_, T> {
 #[repr(C)]
 struct RcuHead<T> {
     // struct rcu_head -> next -> struct cds_wfcq_node -> next
-    next: *mut c_void,
+    _next: *mut c_void,
     // struct rcu_head -> func
-    func: Option<fn(head: *mut c_void)>,
+    _func: Option<fn(head: *mut c_void)>,
     val: T,
 }
 
 impl<T> RcuHead<T> {
     fn new(val: T) -> Self {
         Self {
-            next: null_mut(),
-            func: None,
+            _next: null_mut(),
+            _func: None,
             val,
         }
     }
@@ -336,5 +346,10 @@ mod tests {
     #[test]
     fn rcu_rscs_is_neither_send_nor_sync() {
         assert_not_impl_any!(RcuRSCS: Send, Sync);
+    }
+
+    #[test]
+    fn rcu_ref_is_neither_send_nor_sync() {
+        assert_not_impl_any!(RcuRef<()>: Send, Sync);
     }
 }
