@@ -6,3 +6,5 @@ links = "urcu-memb"
 
 [dev-dependencies]
 crossbeam-utils = "0.8"
+lazy_static = "1.4"
+static_assertions = "1.1"
