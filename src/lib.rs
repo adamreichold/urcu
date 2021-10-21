@@ -36,7 +36,7 @@ impl Rcu {
         Self
     }
 
-    /// Wait for all deferred reclamation initiated prior to calling this by any thread on the system to have completed before it returns.
+    /// Wait for all deferred reclamation initiated by any thread on the system prior to calling this method to have completed.
     pub fn barrier(&self) {
         unsafe {
             rcu_barrier_memb();

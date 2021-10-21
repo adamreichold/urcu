@@ -1,8 +1,12 @@
 [package]
 name = "urcu"
-version = "0.1.0"
-edition = "2021"
+description = "safe wrapper of the memb variant of the userspace RCU library"
+version = "0.0.1"
+edition = "2018"
 links = "urcu-memb"
+authors = ["Adam Reichold <adam.reichold@t-online.de>"]
+license = "LGPL-2.1-or-later"
+repository = "https://github.com/adamreichold/urcu"
 
 [dev-dependencies]
 crossbeam-utils = "0.8"
