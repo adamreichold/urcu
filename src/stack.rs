@@ -27,7 +27,7 @@ impl<T> RcuNode<T>
 where
     T: Send,
 {
-    /// Decay a fully owned node into the inner value.
+    /// Decay a fully owned node into its inner value.
     pub fn into_inner(self) -> T {
         self.val
     }
@@ -53,7 +53,7 @@ where
     }
 }
 
-/// A concurrent stack make out of nodes which are protected by RCU.
+/// A concurrent stack make out of linked nodes which are protected by RCU.
 pub struct RcuStack<T>
 where
     T: Send,
@@ -110,9 +110,9 @@ where
 {
     /// Pop the top node off the stack.
     ///
-    /// Full ownership of the inner value can be recovered after a grace period,
-    /// i.e. by calling `node.into_inner().into_inner()` to unwrap both the `RcuBox`
-    /// as well as the `RcuNode` layers.
+    /// Full ownership of the inner value can be recovered after a grace period
+    /// by calling `node.into_inner().into_inner()` to unwrap both the `RcuBox`
+    /// and the `RcuNode` layers.
     pub fn pop(&self, rscs: &RcuRSCS) -> RcuBox<RcuNode<T>> {
         let mut old_top = self.top.read(rscs);
 
@@ -133,11 +133,11 @@ where
 
     /// Iterate through all values held in nodes reachable from the top node.
     pub fn iter<'a>(&'a self, rscs: &'a RcuRSCS) -> impl Iterator<Item = &'a T> + 'a {
-        let mut curr = self.top.read(rscs).into_ref();
+        let mut curr = self.top.read(rscs).as_ref();
 
         from_fn(move || {
             curr.map(|node| {
-                curr = node.next.read(rscs).into_ref();
+                curr = node.next.read(rscs).as_ref();
 
                 &node.val
             })
@@ -183,7 +183,7 @@ mod tests {
     use crossbeam_utils::thread::scope;
     use static_assertions::assert_impl_all;
 
-    use crate::{tests::RCU, RcuThread};
+    use crate::{Rcu, RcuThread};
 
     #[test]
     fn rcu_node_is_send_and_sync() {
@@ -197,6 +197,8 @@ mod tests {
 
     #[test]
     fn it_works() {
+        let rcu = Rcu::init();
+
         let stack = RcuStack::<AtomicUsize>::new();
 
         const NUM_WRITERS: usize = 1 << 4;
@@ -207,7 +209,7 @@ mod tests {
             scope.spawn(|scope| {
                 for _ in 0..NUM_WRITERS {
                     scope.spawn(|_scope| {
-                        let rcu = RcuThread::register(&RCU);
+                        let rcu = RcuThread::register(&rcu);
 
                         for _ in 0..NUM_ITERS / 2 {
                             rcu.rscs(|rscs| {
@@ -227,7 +229,7 @@ mod tests {
             scope.spawn(|scope| {
                 for _ in 0..NUM_READERS {
                     scope.spawn(|_scope| {
-                        let rcu = RcuThread::register(&RCU);
+                        let rcu = RcuThread::register(&rcu);
 
                         for _ in 0..NUM_ITERS {
                             rcu.rscs(|rscs| {

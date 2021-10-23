@@ -1,14 +1,15 @@
 [package]
 name = "urcu"
 description = "safe wrapper of the memb variant of the userspace RCU library"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2018"
 links = "urcu-memb"
 authors = ["Adam Reichold <adam.reichold@t-online.de>"]
 license = "LGPL-2.1-or-later"
 repository = "https://github.com/adamreichold/urcu"
+keywords = ["rcu", "lock-free", "reclamation", "garbage"]
+categories = ["concurrency", "memory-management"]
 
 [dev-dependencies]
 crossbeam-utils = "0.8"
-lazy_static = "1.4"
 static_assertions = "1.1"

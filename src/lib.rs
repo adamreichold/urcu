@@ -6,19 +6,17 @@ pub mod boxed;
 pub mod stack;
 
 use std::{
-    cell::Cell,
-    ffi::c_void,
-    fmt,
-    marker::PhantomData,
-    ops::Deref,
-    ptr::null_mut,
-    sync::atomic::{AtomicBool, Ordering},
+    cell::Cell, ffi::c_void, fmt, marker::PhantomData, ops::Deref, ptr::null_mut, sync::Once,
+    thread::current,
 };
 
 #[cfg(atomic_ptr)]
-use std::{ptr::read_volatile, sync::atomic::AtomicPtr};
+use std::{
+    ptr::read_volatile,
+    sync::atomic::{AtomicPtr, Ordering},
+};
 
-static INITIALIZED: AtomicBool = AtomicBool::new(false);
+static INITIALIZED: Once = Once::new();
 
 /// Zero-sized token representing that the userspace RCU library was initialized.
 #[derive(Clone, Copy)]
@@ -26,17 +24,17 @@ pub struct Rcu;
 
 impl Rcu {
     /// Initialize the userspace RCU library.
+    ///
+    /// This will be a no-op if it was already called.
     pub fn init() -> Self {
-        assert!(!INITIALIZED.swap(true, Ordering::Relaxed));
-
-        unsafe {
+        INITIALIZED.call_once(|| unsafe {
             rcu_init_memb();
-        }
+        });
 
         Self
     }
 
-    /// Wait for all deferred reclamation initiated by any thread on the system prior to calling this method to have completed.
+    /// Wait for all deferred reclamation initiated by any thread prior to calling this method to have completed.
     pub fn barrier(&self) {
         unsafe {
             rcu_barrier_memb();
@@ -55,8 +53,14 @@ pub struct RcuThread {
 
 impl RcuThread {
     /// Register the current thread with the userspace RCU library.
+    ///
+    /// This will panic if it was already called on the current thread.
     pub fn register(_rcu: &Rcu) -> Self {
-        assert!(!REGISTERED.with(|registered| registered.replace(true)));
+        assert!(
+            !REGISTERED.with(|registered| registered.replace(true)),
+            "Thread {:?} was already registered with the userspace RCU library.",
+            current()
+        );
 
         unsafe {
             rcu_register_thread_memb();
@@ -67,7 +71,7 @@ impl RcuThread {
         }
     }
 
-    /// Establish a read side critical section.
+    /// Establish a read side critical section on the current thread.
     pub fn rscs<F, T>(&self, f: F) -> T
     where
         F: FnOnce(&RcuRSCS) -> T,
@@ -86,7 +90,7 @@ impl Drop for RcuThread {
     }
 }
 
-/// Zero-sized token repsenting a read side critical section.
+/// Zero-sized token repsenting a read side critical section (RSCS).
 pub struct RcuRSCS {
     _marker: PhantomData<*mut ()>,
 }
@@ -160,12 +164,10 @@ where
         let old_ptr = self.ptr.swap(new_ptr, Ordering::AcqRel);
 
         #[cfg(not(atomic_ptr))]
-        let old_ptr = unsafe {
-            rcu_xchg_pointer_sym(
-                &self.ptr as *const *mut RcuHead<T> as *mut *mut RcuHead<T> as *mut *mut c_void,
-                new_ptr as *mut c_void,
-            ) as *mut RcuHead<T>
-        };
+        let old_ptr = rcu_xchg_pointer_sym(
+            &self.ptr as *const *mut RcuHead<T> as *mut *mut RcuHead<T> as *mut *mut c_void,
+            new_ptr as *mut c_void,
+        ) as *mut RcuHead<T>;
 
         old_ptr
     }
@@ -184,7 +186,7 @@ where
         );
 
         #[cfg(not(atomic_ptr))]
-        let result = unsafe {
+        let result = {
             let curr_ptr = rcu_cmpxchg_pointer_sym(
                 &self.ptr as *const *mut RcuHead<T> as *mut *mut RcuHead<T> as *mut *mut c_void,
                 curr.ptr as *mut RcuHead<T> as *mut c_void,
@@ -241,31 +243,17 @@ impl<'a, T> RcuRef<'a, T> {
         }
     }
 
-    /// Access reference if the RCU-protected was not empty.
-    pub fn as_ref(&self) -> Option<&T> {
-        if !self.ptr.is_null() {
-            unsafe { Some(&(*self.ptr).val) }
-        } else {
-            None
-        }
-    }
-
-    /// Decay into reference will full lifetime associated with RSCS.
-    pub fn into_ref(self) -> Option<&'a T> {
-        if !self.ptr.is_null() {
-            unsafe { Some(&(*self.ptr).val) }
-        } else {
-            None
-        }
-    }
-}
-
-impl<T> RcuRef<'_, T>
-where
-    T: Send,
-{
-    fn as_ptr(&self) -> *mut RcuHead<T> {
+    fn as_ptr(self) -> *mut RcuHead<T> {
         self.ptr
+    }
+
+    /// Decay into a reference will the full lifetime associated with the [RSCS](RcuRSCS).
+    pub fn as_ref(self) -> Option<&'a T> {
+        if !self.ptr.is_null() {
+            unsafe { Some(&(*self.ptr).val) }
+        } else {
+            None
+        }
     }
 }
 
@@ -279,9 +267,7 @@ impl<T> Deref for RcuRef<'_, T> {
 
 #[repr(C)]
 struct RcuHead<T> {
-    // struct rcu_head -> next -> struct cds_wfcq_node -> next
     _next: *mut c_void,
-    // struct rcu_head -> func
     _func: Option<fn(head: *mut c_void)>,
     val: T,
 }
@@ -326,12 +312,7 @@ extern "C" {
 mod tests {
     use super::*;
 
-    use lazy_static::lazy_static;
     use static_assertions::{assert_impl_all, assert_not_impl_any};
-
-    lazy_static! {
-        pub static ref RCU: Rcu = Rcu::init();
-    }
 
     #[test]
     fn rcu_send_and_sync() {
