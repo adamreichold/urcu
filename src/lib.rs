@@ -216,6 +216,7 @@ where
 }
 
 /// The current value of an RCU-protected pointer.
+#[derive(PartialEq, Eq, Hash)]
 pub struct RcuRef<'a, T> {
     ptr: *mut RcuHead<T>,
     _marker: PhantomData<&'a T>,

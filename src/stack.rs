@@ -8,7 +8,7 @@ use std::{
     ptr::null_mut,
 };
 
-use crate::{boxed::RcuBox, call_rcu_memb, RcuHead, RcuPtr, RcuRSCS};
+use crate::{boxed::RcuBox, call_rcu_memb, Rcu, RcuHead, RcuPtr, RcuRSCS};
 
 /// The nodes out of which the RCU-protected concurrent stack is assembled.
 pub struct RcuNode<T>
@@ -65,21 +65,12 @@ unsafe impl<T> Send for RcuStack<T> where T: Send {}
 
 unsafe impl<T> Sync for RcuStack<T> where T: Send + Sync {}
 
-impl<T> Default for RcuStack<T>
-where
-    T: Send,
-{
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl<T> RcuStack<T>
 where
     T: Send,
 {
     /// Initialize an empty stack.
-    pub fn new() -> Self {
+    pub fn new(_rcu: &Rcu) -> Self {
         Self {
             top: unsafe { RcuPtr::new(null_mut()) },
         }
@@ -118,7 +109,7 @@ where
 
         loop {
             match old_top.as_ref() {
-                None => return RcuBox::empty(),
+                None => return unsafe { RcuBox::from_raw(null_mut()) },
                 Some(node) => {
                     let new_top = node.next.read(rscs).as_ptr();
 
@@ -199,7 +190,7 @@ mod tests {
     fn it_works() {
         let rcu = Rcu::init();
 
-        let stack = RcuStack::<AtomicUsize>::new();
+        let stack = RcuStack::<AtomicUsize>::new(&rcu);
 
         const NUM_WRITERS: usize = 1 << 4;
         const NUM_READERS: usize = 1 << 10;

@@ -1,7 +1,7 @@
 [package]
 name = "urcu"
 description = "safe wrapper of the memb variant of the userspace RCU library"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2018"
 links = "urcu-memb"
 authors = ["Adam Reichold <adam.reichold@t-online.de>"]

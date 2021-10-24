@@ -2,7 +2,7 @@
 
 use std::{ffi::c_void, mem::forget, ops::ControlFlow, ptr::null_mut};
 
-use crate::{call_rcu_memb, synchronize_rcu_memb, RcuHead, RcuPtr, RcuRSCS, RcuRef};
+use crate::{call_rcu_memb, synchronize_rcu_memb, Rcu, RcuHead, RcuPtr, RcuRSCS, RcuRef};
 
 /// An RCU-protected heap allocation.
 pub struct RcuBox<T>
@@ -21,12 +21,12 @@ where
     T: Send,
 {
     /// Initialize an empty RCU-protected box.
-    pub fn empty() -> Self {
+    pub fn empty(_rcu: &Rcu) -> Self {
         unsafe { Self::from_raw(null_mut()) }
     }
 
     /// Initialize an RCU-protected box with the given value.
-    pub fn new(val: T) -> Self {
+    pub fn new(_rcu: &Rcu, val: T) -> Self {
         let ptr = Box::into_raw(Box::new(RcuHead::new(val)));
 
         unsafe { Self::from_raw(ptr) }
@@ -90,10 +90,11 @@ where
     /// # use urcu::{boxed::RcuBox, Rcu, RcuThread};
     /// #
     /// # spawn(|| {
-    /// # let rcu = Rcu::init();
-    /// # let rcu = RcuThread::register(&rcu);
-    /// #
-    /// let expensive_counter = RcuBox::new(0);
+    /// let rcu = Rcu::init();
+    ///
+    /// let expensive_counter = RcuBox::new(&rcu, 0);
+    ///
+    /// let rcu = RcuThread::register(&rcu);
     ///
     /// rcu.rscs(|rscs| {
     ///     let current_value = expensive_counter.read(rscs);
@@ -189,10 +190,13 @@ mod tests {
 
         let rcu = Rcu::init();
 
-        let count_drops = RcuBox::new(CountDrops {
-            reads: AtomicUsize::new(0),
-            updates: 0,
-        });
+        let count_drops = RcuBox::new(
+            &rcu,
+            CountDrops {
+                reads: AtomicUsize::new(0),
+                updates: 0,
+            },
+        );
 
         const NUM_THREADS: usize = 1 << 10;
         const NUM_ITERS: usize = 1 << 10;
